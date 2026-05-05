@@ -389,6 +389,32 @@ app.get("/scan-now", async (req, res) => {
   await runScan();
 });
 
+app.get("/test-telegram", async (req, res) => {
+  const token = CONFIG.TELEGRAM_BOT_TOKEN;
+  const chatId = CONFIG.TELEGRAM_CHAT_ID;
+
+  if (!token || !chatId) {
+    return res.json({ ok: false, error: "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing from env vars" });
+  }
+
+  try {
+    const response = await axios.post(
+      `https://api.telegram.org/bot${token}/sendMessage`,
+      { chat_id: chatId, text: "✅ Hermes test message — Telegram is connected." },
+      { timeout: 10000 }
+    );
+    res.json({ ok: true, telegram_response: response.data });
+  } catch (e) {
+    res.json({
+      ok: false,
+      error: e.message,
+      telegram_error: e.response?.data || null,
+      token_preview: token ? token.slice(0, 10) + "..." : "MISSING",
+      chat_id_used: chatId || "MISSING",
+    });
+  }
+});
+
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 // ─── CRON SCHEDULE ────────────────────────────────────────────────────────────
