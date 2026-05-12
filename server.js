@@ -27,11 +27,11 @@ let totalSignalsFired = 0;
 
 // ─── RSS SOURCES ─────────────────────────────────────────────────────────────
 const RSS_FEEDS = [
-  { name: "Reuters Business", url: "https://feeds.reuters.com/reuters/businessNews" },
-  { name: "Reuters Markets",  url: "https://feeds.reuters.com/reuters/financials" },
   { name: "FT Markets",       url: "https://www.ft.com/markets?format=rss" },
   { name: "CNBC Finance",     url: "https://www.cnbc.com/id/10000664/device/rss/rss.html" },
   { name: "MarketWatch",      url: "https://feeds.content.dowjones.io/public/rss/mw_topstories" },
+  { name: "Investing.com",    url: "https://www.investing.com/rss/news.rss" },
+  { name: "ForexLive",        url: "https://www.forexlive.com/feed/news" },
 ];
 
 // ─── NEWS FETCHERS ────────────────────────────────────────────────────────────
@@ -310,7 +310,12 @@ urgency values: "breaking" (happened now), "scheduled" (known event upcoming), "
 asset_type values: "commodity", "equity", "forex", "index", "crypto"
 direction values: "bullish", "bearish" — only include directional signals, skip truly neutral headlines
 
-Return ALL directional signals with honest confidence scores. The calling app will apply its own threshold filter. If NO headlines have any directional market impact, return: []`;
+IMPORTANT RULES:
+- Return ONE signal per asset only — never bundle multiple tickers (e.g. do NOT write "CL, RBOB, HO" — pick the most relevant one)
+- Use clean standard asset names: "WTI", "Brent", "XAU/USD", "GBP/USD", "EUR/USD", "USD/JPY", "USD/INR", etc.
+- Return ALL directional signals with honest confidence scores
+- The calling app will apply its own threshold filter
+- If NO headlines have any directional market impact, return: []`;
 
   try {
     const res = await axios.post(
@@ -374,8 +379,8 @@ async function sendTelegramSignal(signal) {
         `<b>Current:</b>    ${L.current}\n` +
         `<b>Entry Zone:</b> ${L.entryLow} – ${L.entryHigh}\n` +
         `<b>Stop Loss:</b>  ${L.sl} (${L.slPct}%)\n` +
-        `<b>TP1:</b>        ${L.tp1} (+${L.tp1Pct}%)\n` +
-        `<b>TP2:</b>        ${L.tp2} (+${L.tp2Pct}%)\n` +
+        `<b>TP1:</b>        ${L.tp1} (${L.tp1Pct}%)\n` +
+        `<b>TP2:</b>        ${L.tp2} (${L.tp2Pct}%)\n` +
         `<b>R:R</b>         1:${L.rr}\n`;
     }
   }
