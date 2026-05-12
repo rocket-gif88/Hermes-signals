@@ -25,6 +25,11 @@ let signalLog = [];              // in-memory log for /status endpoint
 let lastScanTime = null;
 let totalSignalsFired = 0;
 
+// ─── OUTCOME TRACKER STATE ───────────────────────────────────────────────────
+const pendingOutcomes = [];   // signals awaiting price checks
+const outcomeLog = [];        // completed outcome records
+const CHECK_WINDOWS = [4, 12, 24]; // hours after signal to check price
+
 // ─── USAGE TRACKING ──────────────────────────────────────────────────────────
 const usageStats = {
   claude: { inputTokens: 0, outputTokens: 0, calls: 0 },
@@ -562,6 +567,175 @@ function getRegimeAdjustment(regime, asset, direction) {
   return { adjustment, note };
 }
 
+// ─── OUTCOME TRACKER ENGINE ──────────────────────────────────────────────────
+
+function registerSignalForTracking(signal, levels) {
+  if (!levels || !signal.symbol) return;
+  const now = new Date();
+  pendingOutcomes.push({
+    id: `${signal.asset}_${now.getTime()}`,
+    asset: signal.asset,
+    symbol: signal.symbol,
+    direction: signal.direction,
+    confidence: signal.confidence,
+    firedAt: now.toISOString(),
+    entryMid: parseFloat(levels.entryMid),
+    sl: parseFloat(levels.sl),
+    tp1: parseFloat(levels.tp1),
+    tp2: parseFloat(levels.tp2),
+    checks: { "4h": null, "12h": null, "24h": null },
+    outcome: null, // "tp2" | "tp1" | "sl" | "open" | "expired"
+    regimeAtFire: cachedRegime?.regime || "UNKNOWN",
+  });
+}
+
+async function checkPendingOutcomes() {
+  if (pendingOutcomes.length === 0) return;
+  const now = new Date();
+
+  for (const pending of pendingOutcomes) {
+    if (pending.outcome) continue; // already resolved
+
+    const firedAt = new Date(pending.firedAt);
+    const hoursElapsed = (now - firedAt) / 3_600_000;
+
+    // Check each time window
+    for (const window of CHECK_WINDOWS) {
+      const key = `${window}h`;
+      if (pending.checks[key] !== null) continue;
+      if (hoursElapsed < window) continue;
+
+      // Fetch current price
+      try {
+        const res = await axios.get("https://api.twelvedata.com/price", {
+          params: { symbol: pending.symbol, apikey: process.env.TWELVE_DATA_API_KEY },
+          timeout: 8000,
+        });
+        usageStats.twelvedata.calls++;
+        const price = parseFloat(res.data?.price);
+        if (isNaN(price)) continue;
+
+        const isBull = pending.direction === "bullish";
+        let result;
+
+        if (isBull) {
+          if (price >= pending.tp2)       result = "TP2 ✅✅";
+          else if (price >= pending.tp1)  result = "TP1 ✅";
+          else if (price <= pending.sl)   result = "SL ❌";
+          else                            result = "Open ⏳";
+        } else {
+          if (price <= pending.tp2)       result = "TP2 ✅✅";
+          else if (price <= pending.tp1)  result = "TP1 ✅";
+          else if (price >= pending.sl)   result = "SL ❌";
+          else                            result = "Open ⏳";
+        }
+
+        pending.checks[key] = { price, result, checkedAt: now.toISOString() };
+        console.log(`[Outcome] ${pending.asset} @${window}h: ${price} → ${result}`);
+
+        // Resolve final outcome at 24h
+        if (window === 24) {
+          const check = pending.checks["24h"];
+          if (check.result.startsWith("TP2"))      pending.outcome = "tp2";
+          else if (check.result.startsWith("TP1")) pending.outcome = "tp1";
+          else if (check.result.startsWith("SL"))  pending.outcome = "sl";
+          else                                      pending.outcome = "expired";
+
+          // Move to completed log
+          outcomeLog.unshift({ ...pending });
+          if (outcomeLog.length > 500) outcomeLog.splice(400);
+        }
+      } catch (e) {
+        console.error(`[Outcome] Check error for ${pending.symbol}:`, e.message);
+      }
+    }
+  }
+
+  // Clean resolved signals from pending after 26h
+  const cutoff = 26 * 3_600_000;
+  for (let i = pendingOutcomes.length - 1; i >= 0; i--) {
+    const elapsed = now - new Date(pendingOutcomes[i].firedAt);
+    if (elapsed > cutoff) pendingOutcomes.splice(i, 1);
+  }
+}
+
+function buildWeeklyReport() {
+  const now = new Date();
+  const weekAgo = new Date(now - 7 * 24 * 3_600_000);
+  const recent = outcomeLog.filter(o => new Date(o.firedAt) >= weekAgo);
+
+  if (recent.length === 0) return null;
+
+  const total   = recent.length;
+  const tp2     = recent.filter(o => o.outcome === "tp2").length;
+  const tp1     = recent.filter(o => o.outcome === "tp1").length;
+  const sl      = recent.filter(o => o.outcome === "sl").length;
+  const expired = recent.filter(o => o.outcome === "expired").length;
+  const wins    = tp1 + tp2;
+  const winRate = total > 0 ? ((wins / total) * 100).toFixed(0) : 0;
+
+  // Best/worst asset
+  const byAsset = {};
+  for (const o of recent) {
+    if (!byAsset[o.asset]) byAsset[o.asset] = { wins: 0, total: 0 };
+    byAsset[o.asset].total++;
+    if (o.outcome === "tp1" || o.outcome === "tp2") byAsset[o.asset].wins++;
+  }
+  const assetEntries = Object.entries(byAsset).filter(([, v]) => v.total >= 2);
+  const bestAsset  = assetEntries.sort((a, b) => (b[1].wins/b[1].total) - (a[1].wins/a[1].total))[0];
+  const worstAsset = assetEntries.sort((a, b) => (a[1].wins/a[1].total) - (b[1].wins/b[1].total))[0];
+
+  // By regime
+  const byRegime = {};
+  for (const o of recent) {
+    const r = o.regimeAtFire || "UNKNOWN";
+    if (!byRegime[r]) byRegime[r] = { wins: 0, total: 0 };
+    byRegime[r].total++;
+    if (o.outcome === "tp1" || o.outcome === "tp2") byRegime[r].wins++;
+  }
+
+  return {
+    period: "Last 7 days",
+    total, tp2, tp1, sl, expired, wins, winRate,
+    bestAsset:  bestAsset  ? `${bestAsset[0]}  (${bestAsset[1].wins}/${bestAsset[1].total})`  : "insufficient data",
+    worstAsset: worstAsset ? `${worstAsset[0]} (${worstAsset[1].wins}/${worstAsset[1].total})` : "insufficient data",
+    byRegime,
+  };
+}
+
+async function sendWeeklyReport() {
+  const report = buildWeeklyReport();
+  if (!report) {
+    await sendTelegramStatus("📊 <b>Hermes Weekly Report</b>\nNo completed signals yet this week — check back later.");
+    return;
+  }
+
+  const regimeLines = Object.entries(report.byRegime)
+    .map(([r, v]) => `  ${r}: ${v.wins}/${v.total} (${((v.wins/v.total)*100).toFixed(0)}%)`)
+    .join("\n");
+
+  const bar = "━━━━━━━━━━━━━━━━━━";
+  const msg =
+    `📊 <b>HERMES WEEKLY REPORT</b>\n` +
+    `${bar}\n` +
+    `<b>Period:</b>        ${report.period}\n` +
+    `<b>Signals tracked:</b> ${report.total}\n` +
+    `${bar}\n` +
+    `<b>Hit TP2:</b>  ${report.tp2} signals ✅✅\n` +
+    `<b>Hit TP1:</b>  ${report.tp1} signals ✅\n` +
+    `<b>Hit SL:</b>   ${report.sl} signals ❌\n` +
+    `<b>Expired:</b>  ${report.expired} signals ⏳\n` +
+    `<b>Win rate:</b> ${report.winRate}% (TP1 or better)\n` +
+    `${bar}\n` +
+    `<b>Best asset:</b>  ${report.bestAsset}\n` +
+    `<b>Worst asset:</b> ${report.worstAsset}\n` +
+    `${bar}\n` +
+    `<b>By regime:</b>\n${regimeLines}\n` +
+    `${bar}`;
+
+  await sendTelegramStatus(msg);
+}
+
 // ─── DEDUPLICATION ────────────────────────────────────────────────────────────
 
 function deduplicateHeadlines(articles) {
@@ -687,6 +861,9 @@ async function sendTelegramSignal(signal) {
 
     if (priceData) {
       const L = calculateLevels(priceData.currentPrice, priceData.atr, signal.direction);
+      signal.symbol   = symbol;    // store for outcome tracker
+      signal.levels   = L;         // store for outcome tracker
+      signal.entryMid = (parseFloat(L.entryLow) + parseFloat(L.entryHigh)) / 2;
       levelsBlock =
         `${bar}\n` +
         `<b>Current:</b>    ${L.current}\n` +
@@ -756,6 +933,11 @@ async function sendTelegramSignal(signal) {
   } catch (e) {
     console.error("[Telegram] Send error:", e.message);
   }
+}
+
+async function sendTelegramSignalAndTrack(signal, levels) {
+  await sendTelegramSignal(signal);
+  if (levels) registerSignalForTracking(signal, levels);
 }
 
 async function sendTelegramStatus(message) {
@@ -902,9 +1084,10 @@ async function runScan() {
     .sort((a, b) => b.confidence - a.confidence);
   console.log(`[Hermes] ${qualified.length} signals after dedup`);
 
-  // 7. Fire Telegram alerts
+  // 7. Fire Telegram alerts + register for outcome tracking
   for (const signal of qualified) {
     await sendTelegramSignal(signal);
+    if (signal.levels) registerSignalForTracking(signal, signal.levels);
     totalSignalsFired++;
     signalLog.unshift({
       ...signal,
@@ -918,6 +1101,9 @@ async function runScan() {
   usageStats.scans.total++;
   if (qualified.length > 0) usageStats.scans.withSignals++;
   console.log(`[Hermes] Scan complete. ${qualified.length} signals fired (from ${aboveThreshold.length} above threshold).`);
+
+  // Check outcomes of previously fired signals
+  await checkPendingOutcomes();
 }
 
 // ─── EXPRESS ENDPOINTS ────────────────────────────────────────────────────────
@@ -978,6 +1164,25 @@ app.get("/test-telegram", async (req, res) => {
 });
 
 app.get("/health", (req, res) => res.json({ ok: true }));
+
+app.get("/outcomes", (req, res) => {
+  const report = buildWeeklyReport();
+  res.json({
+    pending: pendingOutcomes.length,
+    pendingSignals: pendingOutcomes.map(p => ({
+      asset: p.asset, direction: p.direction, confidence: p.confidence,
+      firedAt: p.firedAt, checks: p.checks, outcome: p.outcome,
+    })),
+    completed: outcomeLog.length,
+    weeklyReport: report || "No completed signals yet",
+    recentOutcomes: outcomeLog.slice(0, 20),
+  });
+});
+
+app.get("/report", async (req, res) => {
+  res.json({ message: "Weekly report triggered — check Telegram" });
+  await sendWeeklyReport();
+});
 
 app.get("/usage", (req, res) => {
   const now = new Date();
@@ -1091,6 +1296,12 @@ app.get("/debug", async (req, res) => {
 const cronExpression = `*/${CONFIG.SCAN_INTERVAL_MINUTES} * * * *`;
 cron.schedule(cronExpression, runScan);
 console.log(`[Hermes] Scan scheduled every ${CONFIG.SCAN_INTERVAL_MINUTES} minutes`);
+
+// Weekly report every Monday at 8:00 AM
+cron.schedule("0 8 * * 1", async () => {
+  console.log("[Hermes] Sending weekly performance report...");
+  await sendWeeklyReport();
+});
 
 // ─── BOOT ─────────────────────────────────────────────────────────────────────
 
