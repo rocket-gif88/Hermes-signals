@@ -14,6 +14,7 @@ const CONFIG = {
   TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID,
   ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+  TWELVE_DATA_API_KEY: process.env.TWELVE_DATA_API_KEY,
   CONFIDENCE_THRESHOLD: parseInt(process.env.CONFIDENCE_THRESHOLD || "70"),
   SCAN_INTERVAL_MINUTES: parseInt(process.env.SCAN_INTERVAL_MINUTES || "15"),
 };
@@ -145,6 +146,119 @@ function keywordFilter(articles) {
   });
 }
 
+// ─── ASSET SYMBOL MAP ────────────────────────────────────────────────────────
+
+const ASSET_SYMBOL_MAP = {
+  // Commodities
+  "wti": "WTI/USD", "crude": "WTI/USD", "crude oil": "WTI/USD", "cl": "WTI/USD", "cl=f": "WTI/USD", "cl/wti": "WTI/USD",
+  "brent": "BRENT/USD", "brent crude": "BRENT/USD",
+  "gold": "XAU/USD", "xau": "XAU/USD", "xau/usd": "XAU/USD",
+  "silver": "XAG/USD", "xag": "XAG/USD", "xag/usd": "XAG/USD",
+  "natural gas": "XNG/USD", "ng": "XNG/USD", "nat gas": "XNG/USD",
+  "copper": "XCU/USD", "hg": "XCU/USD",
+  "c2h6": null, "ethane": null, "lng": null, // no liquid market symbol
+
+  // Forex
+  "usd/inr": "USD/INR", "inr": "USD/INR", "rupee": "USD/INR", "usd/inr bearish": "USD/INR",
+  "gbp/usd": "GBP/USD", "gbpusd": "GBP/USD", "pound": "GBP/USD",
+  "eur/usd": "EUR/USD", "eurusd": "EUR/USD", "euro": "EUR/USD",
+  "usd/jpy": "USD/JPY", "usdjpy": "USD/JPY", "yen": "USD/JPY",
+  "usd/cny": "USD/CNY", "cny/usd": "USD/CNY", "usdcny": "USD/CNY", "yuan": "USD/CNY",
+  "dxy": "DXY", "dollar index": "DXY", "usd index": "DXY",
+  "usd/sar": "USD/SAR", "sar": "USD/SAR",
+};
+
+function resolveSymbol(asset) {
+  if (!asset) return null;
+  const key = asset.toLowerCase().trim();
+  if (key in ASSET_SYMBOL_MAP) return ASSET_SYMBOL_MAP[key];
+  // Partial match fallback
+  for (const [k, v] of Object.entries(ASSET_SYMBOL_MAP)) {
+    if (k && v && (key.includes(k) || k.includes(key))) return v;
+  }
+  return null;
+}
+
+// ─── PRICE + ATR FETCH ────────────────────────────────────────────────────────
+
+async function fetchPriceAndATR(symbol) {
+  if (!symbol || !process.env.TWELVE_DATA_API_KEY) return null;
+  try {
+    // Fetch last 15 daily candles for ATR calculation
+    const res = await axios.get("https://api.twelvedata.com/time_series", {
+      params: {
+        symbol,
+        interval: "1h",
+        outputsize: 20,
+        apikey: process.env.TWELVE_DATA_API_KEY,
+      },
+      timeout: 8000,
+    });
+
+    const values = res.data?.values;
+    if (!values || values.length < 5) return null;
+
+    const candles = values.map(v => ({
+      high: parseFloat(v.high),
+      low: parseFloat(v.low),
+      close: parseFloat(v.close),
+    }));
+
+    // Calculate ATR (14-period)
+    const trueRanges = [];
+    for (let i = 1; i < candles.length; i++) {
+      const tr = Math.max(
+        candles[i].high - candles[i].low,
+        Math.abs(candles[i].high - candles[i - 1].close),
+        Math.abs(candles[i].low - candles[i - 1].close)
+      );
+      trueRanges.push(tr);
+    }
+    const atr = trueRanges.reduce((a, b) => a + b, 0) / trueRanges.length;
+    const currentPrice = candles[0].close;
+
+    return { currentPrice, atr, symbol };
+  } catch (e) {
+    console.error(`[Price] Fetch error for ${symbol}:`, e.message);
+    return null;
+  }
+}
+
+function calculateLevels(currentPrice, atr, direction) {
+  const isBull = direction === "bullish";
+  const dp = currentPrice < 10 ? 5 : currentPrice < 100 ? 4 : currentPrice < 1000 ? 2 : 1;
+  const fmt = (n) => n.toFixed(dp);
+  const pct = (a, b) => (((b - a) / a) * 100).toFixed(2);
+
+  // Entry zone: 0.25 ATR pullback from current price
+  const entryHigh = isBull ? currentPrice : currentPrice + 0.25 * atr;
+  const entryLow  = isBull ? currentPrice - 0.25 * atr : currentPrice;
+  const entryMid  = (entryHigh + entryLow) / 2;
+
+  // SL: 1.5 ATR beyond entry mid
+  const sl   = isBull ? entryMid - 1.5 * atr : entryMid + 1.5 * atr;
+  const tp1  = isBull ? entryMid + 1.5 * atr : entryMid - 1.5 * atr;
+  const tp2  = isBull ? entryMid + 3.0 * atr : entryMid - 3.0 * atr;
+
+  const risk   = Math.abs(entryMid - sl);
+  const reward = Math.abs(tp2 - entryMid);
+  const rr     = (reward / risk).toFixed(1);
+
+  return {
+    current:    fmt(currentPrice),
+    entryLow:   fmt(entryLow),
+    entryHigh:  fmt(entryHigh),
+    sl:         fmt(sl),
+    tp1:        fmt(tp1),
+    tp2:        fmt(tp2),
+    slPct:      pct(entryMid, sl),
+    tp1Pct:     pct(entryMid, tp1),
+    tp2Pct:     pct(entryMid, tp2),
+    rr,
+    atr:        fmt(atr),
+  };
+}
+
 // ─── DEDUPLICATION ────────────────────────────────────────────────────────────
 
 function deduplicateHeadlines(articles) {
@@ -248,6 +362,24 @@ async function sendTelegramSignal(signal) {
   const urgEmoji = urgencyEmoji(signal.urgency);
   const bar = "━━━━━━━━━━━━━━━━━━";
 
+  // Attempt to fetch price levels for commodities/forex
+  let levelsBlock = "";
+  const symbol = resolveSymbol(signal.asset);
+  if (symbol) {
+    const priceData = await fetchPriceAndATR(symbol);
+    if (priceData) {
+      const L = calculateLevels(priceData.currentPrice, priceData.atr, signal.direction);
+      levelsBlock =
+        `${bar}\n` +
+        `<b>Current:</b>    ${L.current}\n` +
+        `<b>Entry Zone:</b> ${L.entryLow} – ${L.entryHigh}\n` +
+        `<b>Stop Loss:</b>  ${L.sl} (${L.slPct}%)\n` +
+        `<b>TP1:</b>        ${L.tp1} (+${L.tp1Pct}%)\n` +
+        `<b>TP2:</b>        ${L.tp2} (+${L.tp2Pct}%)\n` +
+        `<b>R:R</b>         1:${L.rr}\n`;
+    }
+  }
+
   const msg =
     `🗞 <b>HERMES SIGNAL</b>\n` +
     `${bar}\n` +
@@ -255,11 +387,10 @@ async function sendTelegramSignal(signal) {
     `<b>Direction:</b>  ${emoji} ${signal.direction.toUpperCase()}\n` +
     `<b>Catalyst:</b>   ${signal.catalyst}\n` +
     `<b>Source:</b>     ${signal.source}\n` +
-    `<b>Confidence:</b> ${signal.confidence}/100\n` +
-    `<b>Context:</b>    ${signal.context}\n` +
-    `${urgEmoji} <b>Urgency:</b>   ${signal.urgency.toUpperCase()}\n` +
+    `<b>Confidence:</b> ${signal.confidence}/100  |  ${urgEmoji} ${(signal.urgency || "").toUpperCase()}\n` +
+    levelsBlock +
     `${bar}\n` +
-    `<i>${signal.title.slice(0, 120)}</i>`;
+    `<i>${(signal.title || "").slice(0, 120)}</i>`;
 
   try {
     await axios.post(
