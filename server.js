@@ -171,12 +171,12 @@ async function analyzeWithClaude(headlines) {
     .map((h, i) => `${i + 1}. [${h.source}] ${h.title}${h.summary ? " — " + h.summary.slice(0, 120) : ""}`)
     .join("\n");
 
-  const prompt = `You are a professional financial analyst. Analyze the following news headlines and identify ONLY high-confidence trade setups.
+  const prompt = `You are a professional financial analyst. Analyze the following news headlines and identify trade-relevant events.
 
 HEADLINES:
 ${headlineList}
 
-For each headline that represents a meaningful market-moving event, return a JSON array. Only include items where confidence >= 70.
+For each headline that has ANY directional impact on a financial asset, return a JSON array with your honest confidence score.
 
 Return ONLY a valid JSON array, no markdown, no explanation. Format:
 [
@@ -188,15 +188,15 @@ Return ONLY a valid JSON array, no markdown, no explanation. Format:
     "confidence": 82,
     "catalyst": "one sentence explanation",
     "context": "suggested price action context or zone to watch",
-    "urgency": "breaking" 
+    "urgency": "breaking"
   }
 ]
 
 urgency values: "breaking" (happened now), "scheduled" (known event upcoming), "developing" (evolving story)
 asset_type values: "commodity", "equity", "forex", "index", "crypto"
-direction values: "bullish", "bearish", "neutral" (omit neutral — only include if directional)
+direction values: "bullish", "bearish" — only include directional signals, skip truly neutral headlines
 
-If NO headlines meet the 70+ confidence threshold, return an empty array: []`;
+Return ALL directional signals with honest confidence scores. The calling app will apply its own threshold filter. If NO headlines have any directional market impact, return: []`;
 
   try {
     const res = await axios.post(
