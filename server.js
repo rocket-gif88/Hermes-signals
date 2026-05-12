@@ -179,6 +179,13 @@ function resolveSymbol(asset) {
   return null;
 }
 
+function getTier(asset, hasLevels) {
+  if (hasLevels) return { label: "🟢 TIER 1 — ACTIONABLE", note: "Full trade plan below" };
+  const equityPattern = /^[A-Z]{1,5}$/.test(asset) && !["WTI","DXY","VIX","SPY","TLT","GLD","SLV"].includes(asset.toUpperCase());
+  if (equityPattern) return { label: "🟡 TIER 2 — AWARENESS", note: "No levels (equity signal)" };
+  return { label: "🟠 TIER 2 — AWARENESS", note: "No levels for this asset type" };
+}
+
 // ─── PRICE + ATR FETCH ────────────────────────────────────────────────────────
 
 async function fetchPriceAndATR(symbol) {
@@ -385,8 +392,12 @@ async function sendTelegramSignal(signal) {
     }
   }
 
+  const hasLevels = levelsBlock.length > 0;
+  const tier = getTier(signal.asset, hasLevels);
+
   const msg =
     `🗞 <b>HERMES SIGNAL</b>\n` +
+    `${tier.label}\n` +
     `${bar}\n` +
     `<b>Asset:</b>      ${signal.asset}\n` +
     `<b>Direction:</b>  ${emoji} ${signal.direction.toUpperCase()}\n` +
@@ -497,7 +508,44 @@ async function runScan() {
       assetMap.set(key, signal);
     }
   }
-  const qualified = Array.from(assetMap.values())
+  // Filter out invalid/unresolvable asset names
+  const INVALID_PATTERNS = [/xxx/i, /^n\/a$/i, /^unknown$/i, /^n\.a\.$/i];
+  const ALIAS_MAP = {
+    "spx": "SPY", "s&p 500": "SPY", "s&p500": "SPY",
+    "gbpusd": "GBP/USD", "eurusd": "EUR/USD", "usdjpy": "USD/JPY",
+    "usd/inr": "USD/INR", "inr/usd": "USD/INR", "inr": "USD/INR",
+    "xau": "XAU/USD", "gold": "XAU/USD",
+    "xag": "XAG/USD", "silver": "XAG/USD",
+    "wti": "WTI", "crude": "WTI", "crude oil": "WTI",
+    "brent crude": "Brent",
+    "natural gas": "NG", "nat gas": "NG",
+    "dxy": "DXY", "dollar index": "DXY",
+  };
+
+  const cleanedSignals = Array.from(assetMap.values()).map(s => {
+    const key = s.asset?.toLowerCase().trim();
+    if (ALIAS_MAP[key]) s.asset = ALIAS_MAP[key];
+    return s;
+  }).filter(s => {
+    if (!s.asset) return false;
+    if (INVALID_PATTERNS.some(p => p.test(s.asset))) {
+      console.log(`[Hermes] Filtered invalid asset: ${s.asset}`);
+      return false;
+    }
+    return true;
+  });
+
+  // Re-dedup after normalization (catches SPX+SPY, GBP/USD+GBPUSD etc.)
+  const finalMap = new Map();
+  for (const s of cleanedSignals) {
+    const key = s.asset.toLowerCase().trim();
+    const existing = finalMap.get(key);
+    if (!existing || s.confidence > existing.confidence) {
+      finalMap.set(key, s);
+    }
+  }
+
+  const qualified = Array.from(finalMap.values())
     .sort((a, b) => b.confidence - a.confidence);
   console.log(`[Hermes] ${qualified.length} signals after dedup`);
 
