@@ -203,7 +203,7 @@ Return ALL directional signals with honest confidence scores. The calling app wi
       "https://api.anthropic.com/v1/messages",
       {
         model: "claude-haiku-4-5-20251001",
-        max_tokens: 1500,
+        max_tokens: 4000,
         messages: [{ role: "user", content: prompt }],
       },
       {
@@ -325,7 +325,7 @@ async function runScan() {
   }
 
   // 4. Analyze keyword-matched headlines in batches of 40
-  const BATCH_SIZE = 40;
+  const BATCH_SIZE = 20;
   let allSignals = [];
   for (let i = 0; i < relevant.length; i += BATCH_SIZE) {
     const batch = relevant.slice(i, i + BATCH_SIZE);
@@ -438,7 +438,7 @@ app.get("/debug", async (req, res) => {
         "https://api.anthropic.com/v1/messages",
         {
           model: "claude-haiku-4-5-20251001",
-          max_tokens: 1500,
+          max_tokens: 4000,
           messages: [{ role: "user", content: `You are a financial analyst. For each headline below that has directional market impact, return a JSON array with asset, direction (bullish/bearish), confidence (0-100), and catalyst. Return ALL signals, no minimum threshold. Headlines:\n${headlineList}` }],
         },
         {
