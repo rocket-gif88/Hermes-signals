@@ -337,12 +337,35 @@ async function runScan() {
   }
 
   // 5. Filter by threshold
-  const qualified = allSignals.filter(
+  const aboveThreshold = allSignals.filter(
     (s) => s.confidence >= CONFIG.CONFIDENCE_THRESHOLD
   );
-  console.log(`[Hermes] ${allSignals.length} signals found, ${qualified.length} above threshold`);
+  console.log(`[Hermes] ${allSignals.length} signals found, ${aboveThreshold.length} above threshold`);
 
-  // 6. Fire Telegram alerts
+  // 6. Deduplicate by asset — keep highest confidence, drop conflicts
+  const assetMap = new Map();
+  for (const signal of aboveThreshold) {
+    const key = signal.asset?.toLowerCase().trim();
+    if (!key) continue;
+    const existing = assetMap.get(key);
+    if (!existing) {
+      assetMap.set(key, signal);
+    } else if (existing.direction !== signal.direction) {
+      // Conflicting directions — keep higher confidence, flag it
+      if (signal.confidence > existing.confidence) {
+        assetMap.set(key, signal);
+      }
+      console.log(`[Hermes] Conflict on ${signal.asset}: ${existing.direction}(${existing.confidence}) vs ${signal.direction}(${signal.confidence}) — keeping higher`);
+    } else if (signal.confidence > existing.confidence) {
+      // Same direction, higher confidence — replace
+      assetMap.set(key, signal);
+    }
+  }
+  const qualified = Array.from(assetMap.values())
+    .sort((a, b) => b.confidence - a.confidence);
+  console.log(`[Hermes] ${qualified.length} signals after dedup`);
+
+  // 7. Fire Telegram alerts
   for (const signal of qualified) {
     await sendTelegramSignal(signal);
     totalSignalsFired++;
@@ -355,7 +378,7 @@ async function runScan() {
   // Keep log bounded
   if (signalLog.length > 200) signalLog = signalLog.slice(0, 200);
 
-  console.log(`[Hermes] Scan complete. ${qualified.length} signals fired.`);
+  console.log(`[Hermes] Scan complete. ${qualified.length} signals fired (from ${aboveThreshold.length} above threshold).`);
 }
 
 // ─── EXPRESS ENDPOINTS ────────────────────────────────────────────────────────
