@@ -25,6 +25,36 @@ let signalLog = [];              // in-memory log for /status endpoint
 let lastScanTime = null;
 let totalSignalsFired = 0;
 
+// ─── USAGE TRACKING ──────────────────────────────────────────────────────────
+const usageStats = {
+  claude: { inputTokens: 0, outputTokens: 0, calls: 0 },
+  finnhub: { calls: 0, errors: 0 },
+  newsapi: { calls: 0, errors: 0 },
+  rss: { calls: 0, errors: 0 },
+  twelvedata: { calls: 0, errors: 0 },
+  telegram: { calls: 0, errors: 0 },
+  scans: { total: 0, withSignals: 0 },
+  startedAt: new Date().toISOString(),
+};
+
+// Haiku pricing (per million tokens)
+const HAIKU_INPUT_COST_PER_M  = 0.80;
+const HAIKU_OUTPUT_COST_PER_M = 4.00;
+
+function calcClaudeCost() {
+  const inputCost  = (usageStats.claude.inputTokens  / 1_000_000) * HAIKU_INPUT_COST_PER_M;
+  const outputCost = (usageStats.claude.outputTokens / 1_000_000) * HAIKU_OUTPUT_COST_PER_M;
+  return { inputCost, outputCost, totalCost: inputCost + outputCost };
+}
+
+function monthlyProjection(cost) {
+  const now = new Date();
+  const start = new Date(usageStats.startedAt);
+  const hoursRunning = Math.max((now - start) / 3_600_000, 0.01);
+  const costPerHour = cost / hoursRunning;
+  return (costPerHour * 24 * 30).toFixed(4);
+}
+
 // ─── RSS SOURCES ─────────────────────────────────────────────────────────────
 const RSS_FEEDS = [
   { name: "FT Markets",       url: "https://www.ft.com/markets?format=rss" },
@@ -45,7 +75,8 @@ async function fetchFinnhubNews() {
         params: { category: cat, token: CONFIG.FINNHUB_API_KEY },
         timeout: 8000,
       });
-      if (Array.isArray(res.data)) {
+      usageStats.finnhub.calls++;
+    if (Array.isArray(res.data)) {
         allItems.push(
           ...res.data.slice(0, 20).map((item) => ({
             title: item.headline,
@@ -59,6 +90,7 @@ async function fetchFinnhubNews() {
     }
     return allItems;
   } catch (e) {
+    usageStats.finnhub.errors++;
     console.error("[Finnhub] Fetch error:", e.message);
     return [];
   }
@@ -75,6 +107,7 @@ async function fetchNewsAPI() {
       },
       timeout: 8000,
     });
+    usageStats.newsapi.calls++;
     return (res.data.articles || []).map((a) => ({
       title: a.title,
       summary: a.description || "",
@@ -83,6 +116,7 @@ async function fetchNewsAPI() {
       publishedAt: a.publishedAt,
     }));
   } catch (e) {
+    usageStats.newsapi.errors++;
     console.error("[NewsAPI] Fetch error:", e.message);
     return [];
   }
@@ -92,6 +126,7 @@ async function fetchRSSFeeds() {
   const items = [];
   for (const feed of RSS_FEEDS) {
     try {
+      usageStats.rss.calls++;
       const parsed = await rssParser.parseURL(feed.url);
       for (const item of (parsed.items || []).slice(0, 15)) {
         items.push({
@@ -103,6 +138,7 @@ async function fetchRSSFeeds() {
         });
       }
     } catch (e) {
+      usageStats.rss.errors++;
       console.error(`[RSS/${feed.name}] Fetch error:`, e.message);
     }
   }
@@ -191,44 +227,184 @@ function getTier(asset, hasLevels) {
 async function fetchPriceAndATR(symbol) {
   if (!symbol || !process.env.TWELVE_DATA_API_KEY) return null;
   try {
-    // Fetch last 15 daily candles for ATR calculation
+    usageStats.twelvedata.calls++;
     const res = await axios.get("https://api.twelvedata.com/time_series", {
       params: {
         symbol,
         interval: "1h",
-        outputsize: 20,
+        outputsize: 60,
         apikey: process.env.TWELVE_DATA_API_KEY,
       },
       timeout: 8000,
     });
 
     const values = res.data?.values;
-    if (!values || values.length < 5) return null;
+    if (!values || values.length < 20) return null;
 
     const candles = values.map(v => ({
-      high: parseFloat(v.high),
-      low: parseFloat(v.low),
+      high:  parseFloat(v.high),
+      low:   parseFloat(v.low),
       close: parseFloat(v.close),
     }));
 
-    // Calculate ATR (14-period)
+    const closes = candles.map(c => c.close);
+    const currentPrice = closes[0];
+
+    // ATR (14-period)
     const trueRanges = [];
     for (let i = 1; i < candles.length; i++) {
-      const tr = Math.max(
+      trueRanges.push(Math.max(
         candles[i].high - candles[i].low,
         Math.abs(candles[i].high - candles[i - 1].close),
-        Math.abs(candles[i].low - candles[i - 1].close)
-      );
-      trueRanges.push(tr);
+        Math.abs(candles[i].low  - candles[i - 1].close)
+      ));
     }
-    const atr = trueRanges.reduce((a, b) => a + b, 0) / trueRanges.length;
-    const currentPrice = candles[0].close;
+    const atr = trueRanges.slice(0, 14).reduce((a, b) => a + b, 0) / 14;
 
-    return { currentPrice, atr, symbol };
+    // Moving Averages
+    const ma20 = closes.slice(0, 20).reduce((a, b) => a + b, 0) / 20;
+    const ma50 = closes.length >= 50 ? closes.slice(0, 50).reduce((a, b) => a + b, 0) / 50 : null;
+
+    // RSI (14-period)
+    let gains = 0, losses = 0;
+    for (let i = 1; i <= 14; i++) {
+      const diff = closes[i - 1] - closes[i];
+      if (diff > 0) gains  += diff;
+      else          losses -= diff;
+    }
+    const avgGain = gains / 14;
+    const avgLoss = losses / 14;
+    const rsi = avgLoss === 0 ? 100 : 100 - (100 / (1 + avgGain / avgLoss));
+
+    // Weekly range (last 120 hourly candles ~ 5 trading days)
+    const weekSlice = candles.slice(0, Math.min(120, candles.length));
+    const weekHigh = Math.max(...weekSlice.map(c => c.high));
+    const weekLow  = Math.min(...weekSlice.map(c => c.low));
+    const weekPos  = ((currentPrice - weekLow) / (weekHigh - weekLow) * 100).toFixed(1);
+
+    return { currentPrice, atr, symbol, ma20, ma50, rsi, weekHigh, weekLow, weekPos };
   } catch (e) {
+    usageStats.twelvedata.errors++;
     console.error(`[Price] Fetch error for ${symbol}:`, e.message);
     return null;
   }
+}
+
+// ─── MARKET CONTEXT ENGINE ───────────────────────────────────────────────────
+
+async function fetchMarketContext(symbol) {
+  if (!symbol || !process.env.TWELVE_DATA_API_KEY) return null;
+  try {
+    // Fetch 60 hourly candles — enough for 50MA, RSI(14), weekly range
+    const res = await axios.get("https://api.twelvedata.com/time_series", {
+      params: {
+        symbol,
+        interval: "1h",
+        outputsize: 60,
+        apikey: process.env.TWELVE_DATA_API_KEY,
+      },
+      timeout: 8000,
+    });
+
+    const values = res.data?.values;
+    if (!values || values.length < 30) return null;
+
+    const closes = values.map(v => parseFloat(v.close));
+    const highs  = values.map(v => parseFloat(v.high));
+    const lows   = values.map(v => parseFloat(v.low));
+    const current = closes[0];
+
+    // MAs
+    const ma20 = closes.slice(0, 20).reduce((a, b) => a + b, 0) / 20;
+    const ma50 = closes.slice(0, 50).reduce((a, b) => a + b, 0) / 50;
+
+    // RSI(14)
+    const gains = [], losses = [];
+    for (let i = 1; i <= 14; i++) {
+      const diff = closes[i - 1] - closes[i];
+      gains.push(Math.max(diff, 0));
+      losses.push(Math.max(-diff, 0));
+    }
+    const avgGain = gains.reduce((a, b) => a + b, 0) / 14;
+    const avgLoss = losses.reduce((a, b) => a + b, 0) / 14;
+    const rs  = avgLoss === 0 ? 100 : avgGain / avgLoss;
+    const rsi = Math.round(100 - (100 / (1 + rs)));
+
+    // Weekly range (last 40 candles ≈ 5 trading days)
+    const weekHigh = Math.max(...highs.slice(0, 40));
+    const weekLow  = Math.min(...lows.slice(0, 40));
+    const weekRange = weekHigh - weekLow;
+    const posInRange = weekRange > 0
+      ? Math.round(((current - weekLow) / weekRange) * 100)
+      : 50;
+    const pctFromWeekHigh = (((current - weekHigh) / weekHigh) * 100).toFixed(2);
+    const pctFromWeekLow  = (((current - weekLow)  / weekLow)  * 100).toFixed(2);
+
+    // Trend label
+    let trendLabel, trendEmoji;
+    if (current > ma20 && ma20 > ma50) {
+      trendLabel = "Strong uptrend"; trendEmoji = "📈";
+    } else if (current > ma20 && ma20 <= ma50) {
+      trendLabel = "Short-term bullish, below 50MA"; trendEmoji = "↗️";
+    } else if (current < ma20 && ma20 < ma50) {
+      trendLabel = "Strong downtrend"; trendEmoji = "📉";
+    } else if (current < ma20 && ma20 >= ma50) {
+      trendLabel = "Short-term bearish, above 50MA"; trendEmoji = "↘️";
+    } else {
+      trendLabel = "Choppy/ranging"; trendEmoji = "➡️";
+    }
+
+    // RSI label
+    let rsiLabel;
+    if (rsi >= 70)      rsiLabel = "Overbought ⚠️";
+    else if (rsi >= 60) rsiLabel = "Elevated, room narrowing";
+    else if (rsi >= 45) rsiLabel = "Neutral, room to run";
+    else if (rsi >= 30) rsiLabel = "Oversold approach, watch for bounce";
+    else                rsiLabel = "Oversold ⚠️";
+
+    // Position label
+    let posLabel;
+    if (posInRange >= 80)      posLabel = `Near weekly high (${pctFromWeekHigh}% away)`;
+    else if (posInRange >= 55) posLabel = `Upper half of weekly range`;
+    else if (posInRange >= 45) posLabel = `Mid weekly range`;
+    else if (posInRange >= 20) posLabel = `Lower half of weekly range`;
+    else                       posLabel = `Near weekly low (${pctFromWeekLow}% away)`;
+
+    // Signal alignment verdict
+    return { trendLabel, trendEmoji, rsi, rsiLabel, posInRange, posLabel, pctFromWeekHigh, pctFromWeekLow, ma20, ma50, current };
+  } catch (e) {
+    console.error(`[Context] Fetch error for ${symbol}:`, e.message);
+    return null;
+  }
+}
+
+function getContextVerdict(ctx, direction) {
+  if (!ctx) return null;
+  const isBull = direction === "bullish";
+  let score = 0;
+  let flags = [];
+
+  // Trend alignment
+  if (isBull && ctx.current > ctx.ma20) { score += 2; }
+  else if (!isBull && ctx.current < ctx.ma20) { score += 2; }
+  else { score -= 1; flags.push("price vs trend"); }
+
+  // RSI check
+  if (isBull && ctx.rsi >= 70) { score -= 2; flags.push("overbought"); }
+  else if (!isBull && ctx.rsi <= 30) { score -= 2; flags.push("oversold"); }
+  else { score += 1; }
+
+  // Position in range
+  if (isBull && ctx.posInRange >= 85) { score -= 1; flags.push("near weekly high"); }
+  else if (!isBull && ctx.posInRange <= 15) { score -= 1; flags.push("near weekly low"); }
+  else { score += 1; }
+
+  let verdict, verdictEmoji;
+  if (score >= 3) { verdict = "Structure supports signal";    verdictEmoji = "✅"; }
+  else if (score >= 1) { verdict = "Partial confluence";      verdictEmoji = "⚠️"; }
+  else { verdict = "Structure conflicts with signal";          verdictEmoji = "❌"; }
+
+  return { verdict, verdictEmoji, score, flags };
 }
 
 function calculateLevels(currentPrice, atr, direction) {
@@ -264,6 +440,126 @@ function calculateLevels(currentPrice, atr, direction) {
     rr,
     atr:        fmt(atr),
   };
+}
+
+// ─── REGIME FILTER ───────────────────────────────────────────────────────────
+
+let cachedRegime = null; // refreshed each scan
+
+async function fetchRegimeData() {
+  if (!process.env.TWELVE_DATA_API_KEY) return null;
+  try {
+    // Fetch VIX, DXY, SPY in parallel
+    const [vixRes, dxyRes, spyRes] = await Promise.allSettled([
+      axios.get("https://api.twelvedata.com/time_series", {
+        params: { symbol: "VIX", interval: "1h", outputsize: 20, apikey: process.env.TWELVE_DATA_API_KEY },
+        timeout: 8000,
+      }),
+      axios.get("https://api.twelvedata.com/time_series", {
+        params: { symbol: "DXY", interval: "1h", outputsize: 20, apikey: process.env.TWELVE_DATA_API_KEY },
+        timeout: 8000,
+      }),
+      axios.get("https://api.twelvedata.com/time_series", {
+        params: { symbol: "SPY", interval: "1h", outputsize: 25, apikey: process.env.TWELVE_DATA_API_KEY },
+        timeout: 8000,
+      }),
+    ]);
+
+    const extract = (res) => {
+      if (res.status !== "fulfilled") return null;
+      const values = res.value?.data?.values;
+      if (!values || values.length < 5) return null;
+      const closes = values.map(v => parseFloat(v.close));
+      const current = closes[0];
+      const ma20 = closes.slice(0, Math.min(20, closes.length)).reduce((a, b) => a + b, 0) / Math.min(20, closes.length);
+      const change1h = closes.length > 1 ? (((closes[0] - closes[1]) / closes[1]) * 100).toFixed(2) : "0.00";
+      return { current, ma20, change1h };
+    };
+
+    const vix = extract(vixRes);
+    const dxy = extract(dxyRes);
+    const spy = extract(spyRes);
+
+    if (!vix) return null;
+
+    // Determine regime
+    let regime, regimeEmoji, regimeDesc;
+    if (vix.current > 35) {
+      regime = "CRISIS"; regimeEmoji = "🔴";
+      regimeDesc = "Extreme fear — flight to safety dominant";
+    } else if (vix.current > 25) {
+      regime = "RISK-OFF"; regimeEmoji = "🟠";
+      regimeDesc = "Elevated fear — defensive positioning favored";
+    } else if (vix.current > 15) {
+      regime = "NEUTRAL"; regimeEmoji = "🟡";
+      regimeDesc = "Moderate uncertainty — selective exposure";
+    } else {
+      regime = "RISK-ON"; regimeEmoji = "🟢";
+      regimeDesc = "Low fear — growth assets favored";
+    }
+
+    // DXY bias
+    const dxyBias = dxy
+      ? dxy.current > dxy.ma20 ? "strengthening 📈" : "weakening 📉"
+      : "unavailable";
+
+    // SPY bias
+    const spyBias = spy
+      ? spy.current > spy.ma20 ? "above MA20 — bullish" : "below MA20 — bearish"
+      : "unavailable";
+
+    const result = {
+      regime, regimeEmoji, regimeDesc,
+      vix: vix.current.toFixed(2),
+      vixChange: vix.change1h,
+      dxy: dxy ? dxy.current.toFixed(3) : null,
+      dxyBias,
+      spy: spy ? spy.current.toFixed(2) : null,
+      spyBias,
+      fetchedAt: new Date().toISOString(),
+    };
+
+    usageStats.twelvedata.calls += 3;
+    return result;
+  } catch (e) {
+    console.error("[Regime] Fetch error:", e.message);
+    return null;
+  }
+}
+
+function getRegimeAdjustment(regime, asset, direction) {
+  if (!regime) return { adjustment: 0, note: null };
+  const r = regime.regime;
+  const a = (asset || "").toLowerCase();
+  const isBull = direction === "bullish";
+
+  // Asset category
+  const isSafe   = /gold|xau|silver|xag|bond|tlt|treasury/.test(a);
+  const isOil    = /wti|brent|crude|oil/.test(a);
+  const isEquity = /spy|spx|nasdaq|qqq|stock|equity/.test(a);
+  const isEM     = /inr|try|brl|zar|mxn|emerging/.test(a);
+  const isDXY    = /dxy|dollar/.test(a);
+
+  let adjustment = 0;
+  let note = null;
+
+  if (r === "CRISIS" || r === "RISK-OFF") {
+    if (isSafe  &&  isBull) { adjustment = +10; note = "Safe haven demand supports signal"; }
+    if (isSafe  && !isBull) { adjustment =  -8; note = "Risk-off conflicts with bearish safe haven"; }
+    if (isEquity && isBull) { adjustment = -12; note = "Risk-off environment weakens bullish equity case"; }
+    if (isEM    && !isBull) { adjustment =  +8; note = "EM weakness aligns with risk-off"; }
+    if (isDXY   &&  isBull) { adjustment =  +6; note = "Flight to dollar supports DXY bullish"; }
+    if (isOil   &&  isBull && r === "CRISIS") { adjustment = +5; note = "Supply shock premium in crisis"; }
+  }
+
+  if (r === "RISK-ON") {
+    if (isEquity && isBull) { adjustment = +8;  note = "Risk-on supports equity longs"; }
+    if (isSafe  &&  isBull) { adjustment = -6;  note = "Risk-on reduces safe haven demand"; }
+    if (isEM    &&  isBull) { adjustment = +6;  note = "Risk appetite supports EM longs"; }
+    if (isDXY   && !isBull) { adjustment = +5;  note = "Risk-on typically weakens dollar"; }
+  }
+
+  return { adjustment, note };
 }
 
 // ─── DEDUPLICATION ────────────────────────────────────────────────────────────
@@ -342,6 +638,11 @@ IMPORTANT RULES:
       }
     );
 
+    // Track token usage
+    usageStats.claude.calls++;
+    usageStats.claude.inputTokens  += res.data.usage?.input_tokens  || 0;
+    usageStats.claude.outputTokens += res.data.usage?.output_tokens || 0;
+
     const raw = res.data.content?.[0]?.text || "[]";
     const clean = raw.replace(/```json|```/g, "").trim();
     const signals = JSON.parse(clean);
@@ -374,11 +675,16 @@ async function sendTelegramSignal(signal) {
   const urgEmoji = urgencyEmoji(signal.urgency);
   const bar = "━━━━━━━━━━━━━━━━━━";
 
-  // Attempt to fetch price levels for commodities/forex
+  // Fetch price levels + market context in parallel
   let levelsBlock = "";
+  let contextBlock = "";
   const symbol = resolveSymbol(signal.asset);
   if (symbol) {
-    const priceData = await fetchPriceAndATR(symbol);
+    const [priceData, ctx] = await Promise.all([
+      fetchPriceAndATR(symbol),
+      fetchMarketContext(symbol),
+    ]);
+
     if (priceData) {
       const L = calculateLevels(priceData.currentPrice, priceData.atr, signal.direction);
       levelsBlock =
@@ -390,10 +696,24 @@ async function sendTelegramSignal(signal) {
         `<b>TP2:</b>        ${L.tp2} (${L.tp2Pct}%)\n` +
         `<b>R:R</b>         1:${L.rr}\n`;
     }
+
+    if (ctx) {
+      const verdict = getContextVerdict(ctx, signal.direction);
+      contextBlock =
+        `${bar}\n` +
+        `📊 <b>MARKET CONTEXT</b>\n` +
+        `<b>Trend:</b>    ${ctx.trendEmoji} ${ctx.trendLabel}\n` +
+        `<b>RSI(14):</b>  ${ctx.rsi} — ${ctx.rsiLabel}\n` +
+        `<b>Position:</b> ${ctx.posLabel}\n` +
+        (verdict ? `<b>Verdict:</b>  ${verdict.verdictEmoji} ${verdict.verdict}\n` : "") +
+        (verdict?.flags?.length ? `<b>Flags:</b>    ${verdict.flags.join(", ")}\n` : "");
+    }
   }
 
   const hasLevels = levelsBlock.length > 0;
   const tier = getTier(signal.asset, hasLevels);
+
+
 
   const msg =
     `🗞 <b>HERMES SIGNAL</b>\n` +
@@ -405,10 +725,23 @@ async function sendTelegramSignal(signal) {
     `<b>Source:</b>     ${signal.source}\n` +
     `<b>Confidence:</b> ${signal.confidence}/100  |  ${urgEmoji} ${(signal.urgency || "").toUpperCase()}\n` +
     levelsBlock +
+    contextBlock +
+    (cachedRegime && hasLevels ?
+      `${bar}\n` +
+      `🌐 <b>MARKET REGIME</b>\n` +
+      `<b>Regime:</b>  ${cachedRegime.regimeEmoji} ${cachedRegime.regime} — ${cachedRegime.regimeDesc}\n` +
+      `<b>VIX:</b>     ${cachedRegime.vix} (${cachedRegime.vixChange}% 1h)\n` +
+      `<b>DXY:</b>     ${cachedRegime.dxy || "n/a"} — ${cachedRegime.dxyBias}\n` +
+      `<b>SPY:</b>     ${cachedRegime.spy || "n/a"} — ${cachedRegime.spyBias}\n` +
+      (signal.regimeNote ? `<b>Regime note:</b> ${signal.regimeNote}\n` : "") +
+      (signal.regimeAdjustment && signal.regimeAdjustment !== 0 ?
+        `<b>Confidence adj:</b> ${signal.regimeAdjustment > 0 ? "+" : ""}${signal.regimeAdjustment} from regime\n` : "")
+      : "") +
     `${bar}\n` +
     `<i>${(signal.title || "").slice(0, 120)}</i>`;
 
   try {
+    usageStats.telegram.calls++;
     await axios.post(
       `https://api.telegram.org/bot${CONFIG.TELEGRAM_BOT_TOKEN}/sendMessage`,
       {
@@ -442,6 +775,12 @@ async function sendTelegramStatus(message) {
 async function runScan() {
   console.log(`\n[Hermes] Scan started at ${new Date().toISOString()}`);
   lastScanTime = new Date().toISOString();
+
+  // 0. Fetch market regime (once per scan)
+  cachedRegime = await fetchRegimeData();
+  if (cachedRegime) {
+    console.log(`[Hermes] Regime: ${cachedRegime.regime} | VIX: ${cachedRegime.vix} | DXY: ${cachedRegime.dxy || "n/a"}`);
+  }
 
   // 1. Fetch from all sources in parallel
   const [finnhub, newsapi, rss] = await Promise.all([
@@ -489,9 +828,23 @@ async function runScan() {
   );
   console.log(`[Hermes] ${allSignals.length} signals found, ${aboveThreshold.length} above threshold`);
 
-  // 6. Deduplicate by asset — keep highest confidence, drop conflicts
+  // 6. Apply regime adjustment to confidence scores
+  const regimeAdjusted = aboveThreshold.map(signal => {
+    const { adjustment, note } = getRegimeAdjustment(cachedRegime, signal.asset, signal.direction);
+    if (adjustment !== 0) {
+      console.log(`[Regime] ${signal.asset} ${signal.direction}: ${adjustment > 0 ? "+" : ""}${adjustment} (${note})`);
+    }
+    return {
+      ...signal,
+      confidence: Math.min(100, Math.max(0, signal.confidence + adjustment)),
+      regimeNote: note,
+      regimeAdjustment: adjustment,
+    };
+  }).filter(s => s.confidence >= CONFIG.CONFIDENCE_THRESHOLD); // re-filter after adjustment
+
+  // 7. Deduplicate by asset — keep highest confidence, drop conflicts
   const assetMap = new Map();
-  for (const signal of aboveThreshold) {
+  for (const signal of regimeAdjusted) {
     const key = signal.asset?.toLowerCase().trim();
     if (!key) continue;
     const existing = assetMap.get(key);
@@ -562,6 +915,8 @@ async function runScan() {
   // Keep log bounded
   if (signalLog.length > 200) signalLog = signalLog.slice(0, 200);
 
+  usageStats.scans.total++;
+  if (qualified.length > 0) usageStats.scans.withSignals++;
   console.log(`[Hermes] Scan complete. ${qualified.length} signals fired (from ${aboveThreshold.length} above threshold).`);
 }
 
@@ -623,6 +978,50 @@ app.get("/test-telegram", async (req, res) => {
 });
 
 app.get("/health", (req, res) => res.json({ ok: true }));
+
+app.get("/usage", (req, res) => {
+  const now = new Date();
+  const start = new Date(usageStats.startedAt);
+  const hoursRunning = Math.max((now - start) / 3_600_000, 0.01);
+  const daysRunning = (hoursRunning / 24).toFixed(1);
+
+  const { inputCost, outputCost, totalCost } = calcClaudeCost();
+  const projected = monthlyProjection(totalCost);
+
+  const successRate = (scans) => scans.calls
+    ? `${(((scans.calls - scans.errors) / scans.calls) * 100).toFixed(1)}%`
+    : "n/a";
+
+  res.json({
+    summary: {
+      uptimeDays: daysRunning,
+      startedAt: usageStats.startedAt,
+      totalScans: usageStats.scans.total,
+      scansWithSignals: usageStats.scans.withSignals,
+      totalSignalsFired,
+    },
+    claude: {
+      calls: usageStats.claude.calls,
+      inputTokens: usageStats.claude.inputTokens.toLocaleString(),
+      outputTokens: usageStats.claude.outputTokens.toLocaleString(),
+      totalTokens: (usageStats.claude.inputTokens + usageStats.claude.outputTokens).toLocaleString(),
+      costToDate: "$" + totalCost.toFixed(4),
+      inputCost: "$" + inputCost.toFixed(4),
+      outputCost: "$" + outputCost.toFixed(4),
+      projectedMonthlyCost: "$" + projected,
+    },
+    dataSources: {
+      finnhub:   { calls: usageStats.finnhub.calls,   errors: usageStats.finnhub.errors,   successRate: successRate(usageStats.finnhub) },
+      newsapi:   { calls: usageStats.newsapi.calls,   errors: usageStats.newsapi.errors,   successRate: successRate(usageStats.newsapi) },
+      rss:       { calls: usageStats.rss.calls,       errors: usageStats.rss.errors,       successRate: successRate(usageStats.rss) },
+      twelvedata:{ calls: usageStats.twelvedata.calls, errors: usageStats.twelvedata.errors, successRate: successRate(usageStats.twelvedata) },
+    },
+    telegram: {
+      messagesSent: usageStats.telegram.calls,
+    },
+    note: "Stats reset on each Railway redeploy. For persistent monthly totals use console.anthropic.com",
+  });
+});
 
 app.get("/debug", async (req, res) => {
   try {
