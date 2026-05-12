@@ -417,6 +417,27 @@ app.get("/test-telegram", async (req, res) => {
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
+app.get("/debug", async (req, res) => {
+  try {
+    const finnhub = await fetchFinnhubNews();
+    const sample = finnhub.slice(0, 15);
+    const filtered = keywordFilter(sample);
+    const toAnalyze = filtered.length > 0 ? filtered : sample;
+    const signals = await analyzeWithClaude(toAnalyze);
+    res.json({
+      step1_fetched: sample.length,
+      step1_titles: sample.map(a => a.title),
+      step2_keyword_matches: filtered.length,
+      step2_matched_titles: filtered.map(a => a.title),
+      step3_claude_signals: signals,
+      current_threshold: CONFIG.CONFIDENCE_THRESHOLD,
+      signals_above_threshold: signals.filter(s => s.confidence >= CONFIG.CONFIDENCE_THRESHOLD).length,
+    });
+  } catch (e) {
+    res.json({ error: e.message });
+  }
+});
+
 // ─── CRON SCHEDULE ────────────────────────────────────────────────────────────
 
 const cronExpression = `*/${CONFIG.SCAN_INTERVAL_MINUTES} * * * *`;
