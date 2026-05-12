@@ -423,18 +423,60 @@ app.get("/debug", async (req, res) => {
     const sample = finnhub.slice(0, 15);
     const filtered = keywordFilter(sample);
     const toAnalyze = filtered.length > 0 ? filtered : sample;
-    const signals = await analyzeWithClaude(toAnalyze);
+
+    // Call Claude directly and expose raw response
+    const headlineList = toAnalyze
+      .map((h, i) => `${i + 1}. [${h.source}] ${h.title}`)
+      .join("\n");
+
+    let claudeRaw = null;
+    let claudeError = null;
+    let claudeParsed = null;
+
+    try {
+      const claudeRes = await axios.post(
+        "https://api.anthropic.com/v1/messages",
+        {
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 1500,
+          messages: [{ role: "user", content: `You are a financial analyst. For each headline below that has directional market impact, return a JSON array with asset, direction (bullish/bearish), confidence (0-100), and catalyst. Return ALL signals, no minimum threshold. Headlines:\n${headlineList}` }],
+        },
+        {
+          headers: {
+            "x-api-key": CONFIG.ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+          },
+          timeout: 30000,
+        }
+      );
+      claudeRaw = claudeRes.data.content?.[0]?.text || "NO TEXT IN RESPONSE";
+      try {
+        const clean = claudeRaw.replace(/```json|```/g, "").trim();
+        claudeParsed = JSON.parse(clean);
+      } catch(parseErr) {
+        claudeParsed = "PARSE ERROR: " + parseErr.message;
+      }
+    } catch(apiErr) {
+      claudeError = {
+        message: apiErr.message,
+        status: apiErr.response?.status,
+        data: apiErr.response?.data,
+        anthropic_key_preview: CONFIG.ANTHROPIC_API_KEY ? CONFIG.ANTHROPIC_API_KEY.slice(0, 15) + "..." : "MISSING",
+      };
+    }
+
     res.json({
       step1_fetched: sample.length,
-      step1_titles: sample.map(a => a.title),
       step2_keyword_matches: filtered.length,
       step2_matched_titles: filtered.map(a => a.title),
-      step3_claude_signals: signals,
+      step3_claude_raw: claudeRaw,
+      step3_claude_parsed: claudeParsed,
+      step3_claude_error: claudeError,
       current_threshold: CONFIG.CONFIDENCE_THRESHOLD,
-      signals_above_threshold: signals.filter(s => s.confidence >= CONFIG.CONFIDENCE_THRESHOLD).length,
     });
   } catch (e) {
-    res.json({ error: e.message });
+    res.json({ error: e.message, stack: e.stack });
   }
 });
 
