@@ -15,7 +15,7 @@ const CONFIG = {
   TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID,
   ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
   TWELVE_DATA_API_KEY: process.env.TWELVE_DATA_API_KEY,
-  CONFIDENCE_THRESHOLD: parseInt(process.env.CONFIDENCE_THRESHOLD || "70"),
+  CONFIDENCE_THRESHOLD: parseInt(process.env.CONFIDENCE_THRESHOLD || "75"),
   SCAN_INTERVAL_MINUTES: parseInt(process.env.SCAN_INTERVAL_MINUTES || "15"),
 };
 
@@ -564,6 +564,20 @@ function getRegimeAdjustment(regime, asset, direction) {
     if (isDXY   && !isBull) { adjustment = +5;  note = "Risk-on typically weakens dollar"; }
   }
 
+  // ── Gold/DXY inverse correlation override ─────────────────────────────────
+  // Gold and DXY are inversely correlated. If DXY is strengthening and we have
+  // a bullish gold signal, penalise hard regardless of regime.
+  if (regime && isSafe && isBull && /gold|xau/.test(a)) {
+    const dxyStrengthening = regime.dxyBias && regime.dxyBias.includes("strengthening");
+    if (dxyStrengthening) {
+      const dxyPenalty = -10;
+      adjustment += dxyPenalty;
+      note = note
+        ? `${note}; DXY strengthening conflicts with bullish gold (−10)`
+        : "DXY strengthening conflicts with bullish gold (−10)";
+    }
+  }
+
   return { adjustment, note };
 }
 
@@ -778,6 +792,7 @@ Return ONLY a valid JSON array, no markdown, no explanation. Format:
     "direction": "bullish",
     "confidence": 82,
     "catalyst": "one sentence explanation",
+    "catalyst_category": "macro",
     "context": "suggested price action context or zone to watch",
     "urgency": "breaking"
   }
@@ -786,6 +801,13 @@ Return ONLY a valid JSON array, no markdown, no explanation. Format:
 urgency values: "breaking" (happened now), "scheduled" (known event upcoming), "developing" (evolving story)
 asset_type values: "commodity", "equity", "forex", "index", "crypto"
 direction values: "bullish", "bearish" — only include directional signals, skip truly neutral headlines
+catalyst_category values (CRITICAL — classify carefully):
+  "macro"       — Fed decisions, FOMC, rate changes, CPI/PCE/NFP data, central bank policy, geopolitical escalation,
+                  war/sanctions/tariffs, debt ceiling, sovereign default, major DXY moves, recession signals
+  "sector"      — OPEC production decisions, major commodity supply disruptions, large ETF flow events,
+                  significant sector-wide regulatory changes with direct price mechanism
+  "tangential"  — Mining/energy company M&A, individual stock earnings, analyst upgrades/downgrades,
+                  company restructuring, IPOs, buybacks — events with NO direct mechanism to move the spot asset
 
 IMPORTANT RULES:
 - Return ONE signal per asset only — never bundle multiple tickers (e.g. do NOT write "CL, RBOB, HO" — pick the most relevant one)
@@ -827,6 +849,7 @@ IMPORTANT RULES:
       source: headlines[s.headline_index - 1]?.source || "Unknown",
       url: headlines[s.headline_index - 1]?.url || "",
       title: headlines[s.headline_index - 1]?.title || "",
+      publishedAt: headlines[s.headline_index - 1]?.publishedAt || null,
     }));
   } catch (e) {
     console.error("[Claude] Analysis error:", e.message);
@@ -852,6 +875,7 @@ async function sendTelegramSignal(signal) {
   // Fetch price levels + market context in parallel
   let levelsBlock = "";
   let contextBlock = "";
+  let statusBlock = "";
   const symbol = resolveSymbol(signal.asset);
   if (symbol) {
     const [priceData, ctx] = await Promise.all([
@@ -876,6 +900,15 @@ async function sendTelegramSignal(signal) {
 
     if (ctx) {
       const verdict = getContextVerdict(ctx, signal.direction);
+
+      // ── TREND ALIGNMENT HARD GATE ────────────────────────────────────────────
+      // If structure directly conflicts with signal direction, require 85+ confidence
+      // to proceed. Below that threshold, block the signal entirely.
+      if (verdict && verdict.score < 0 && signal.confidence < 85) {
+        console.log(`[Hermes] BLOCKED (counter-trend, conf ${signal.confidence} < 85): ${signal.asset} ${signal.direction} — ${verdict.flags.join(", ")}`);
+        return { fired: false, reason: "counter-trend" };
+      }
+
       contextBlock =
         `${bar}\n` +
         `📊 <b>MARKET CONTEXT</b>\n` +
@@ -884,6 +917,34 @@ async function sendTelegramSignal(signal) {
         `<b>Position:</b> ${ctx.posLabel}\n` +
         (verdict ? `<b>Verdict:</b>  ${verdict.verdictEmoji} ${verdict.verdict}\n` : "") +
         (verdict?.flags?.length ? `<b>Flags:</b>    ${verdict.flags.join(", ")}\n` : "");
+
+      // ── SIGNAL STATUS BLOCK ──────────────────────────────────────────────────
+      const session = getTradingSession();
+      const isCounterTrend = verdict && verdict.flags.includes("price vs trend");
+      const conf = signal.confidence;
+      let statusLine, sizingNote;
+
+      if (conf >= 80 && !isCounterTrend) {
+        statusLine  = `🟢 <b>STATUS: HIGH CONFIDENCE</b> — Full size`;
+        sizingNote  = `Suggested risk: 1% of account`;
+      } else if (conf >= 75 || isCounterTrend) {
+        statusLine  = `🟡 <b>STATUS: CONDITIONAL</b> — Reduce size, TP1 only`;
+        sizingNote  = `Suggested risk: 0.5% of account`;
+      } else {
+        statusLine  = `🟡 <b>STATUS: CONDITIONAL</b> — Minimum size`;
+        sizingNote  = `Suggested risk: 0.25% of account`;
+      }
+
+      const sessionNote = !session.active
+        ? `⚠️ <b>Session:</b> ${session.emoji} ${session.label} — lower follow-through expected`
+        : `<b>Session:</b> ${session.emoji} ${session.label}`;
+
+      statusBlock =
+        `${bar}\n` +
+        `${statusLine}\n` +
+        `<b>${sizingNote}</b>\n` +
+        (signal.staleNote ? `⏱ <b>Note:</b> ${signal.staleNote}\n` : "") +
+        `${sessionNote}\n`;
     }
   }
 
@@ -899,10 +960,12 @@ async function sendTelegramSignal(signal) {
     `<b>Asset:</b>      ${signal.asset}\n` +
     `<b>Direction:</b>  ${emoji} ${signal.direction.toUpperCase()}\n` +
     `<b>Catalyst:</b>   ${signal.catalyst}\n` +
+    `<b>Cat. type:</b>  ${signal.catalyst_category ? signal.catalyst_category.toUpperCase() : "UNKNOWN"}\n` +
     `<b>Source:</b>     ${signal.source}\n` +
     `<b>Confidence:</b> ${signal.confidence}/100  |  ${urgEmoji} ${(signal.urgency || "").toUpperCase()}\n` +
     levelsBlock +
     contextBlock +
+    statusBlock +
     (cachedRegime && hasLevels ?
       `${bar}\n` +
       `🌐 <b>MARKET REGIME</b>\n` +
@@ -930,8 +993,10 @@ async function sendTelegramSignal(signal) {
       { timeout: 10000 }
     );
     console.log(`[Telegram] Signal sent: ${signal.asset} ${signal.direction} (${signal.confidence})`);
+    return { fired: true };
   } catch (e) {
     console.error("[Telegram] Send error:", e.message);
+    return { fired: false, reason: "telegram_error" };
   }
 }
 
@@ -950,6 +1015,19 @@ async function sendTelegramStatus(message) {
   } catch (e) {
     console.error("[Telegram] Status send error:", e.message);
   }
+}
+
+// ─── TRADING SESSION HELPER ──────────────────────────────────────────────────
+
+function getTradingSession() {
+  const h = new Date().getUTCHours();
+  // London open: 08:00–17:00 UTC | NY open: 13:00–22:00 UTC
+  const londonOpen = h >= 8  && h < 17;
+  const nyOpen     = h >= 13 && h < 22;
+  if (londonOpen && nyOpen) return { label: "London/NY Overlap",  emoji: "🟢", active: true };
+  if (londonOpen)            return { label: "London Session",     emoji: "🟡", active: true };
+  if (nyOpen)                return { label: "NY Session",         emoji: "🟡", active: true };
+  return                            { label: "Asian Session",      emoji: "🔴", active: false };
 }
 
 // ─── MAIN SCAN LOOP ───────────────────────────────────────────────────────────
@@ -1010,8 +1088,32 @@ async function runScan() {
   );
   console.log(`[Hermes] ${allSignals.length} signals found, ${aboveThreshold.length} above threshold`);
 
+  // 5a. Block TANGENTIAL catalysts — they have no direct price mechanism
+  const catalogueFiltered = aboveThreshold.filter(s => {
+    if (s.catalyst_category === "tangential") {
+      console.log(`[Hermes] BLOCKED (tangential catalyst): ${s.asset} "${s.title?.slice(0, 80)}"`);
+      return false;
+    }
+    return true;
+  });
+  console.log(`[Hermes] ${aboveThreshold.length - catalogueFiltered.length} signals blocked as tangential`);
+
+  // 5b. Stale news penalty — cap confidence if article is >60 min old
+  const now60 = Date.now();
+  const ageChecked = catalogueFiltered.map(s => {
+    if (!s.publishedAt) return s;
+    const ageMin = (now60 - new Date(s.publishedAt).getTime()) / 60000;
+    if (ageMin > 60) {
+      const stalePenalty = Math.min(15, Math.floor((ageMin - 60) / 30) * 5); // −5 per extra 30 min, max −15
+      const newConf = s.confidence - stalePenalty;
+      console.log(`[Hermes] Stale news (${ageMin.toFixed(0)}m old): ${s.asset} confidence ${s.confidence} → ${newConf}`);
+      return { ...s, confidence: newConf, staleNote: `News is ${ageMin.toFixed(0)}m old — may be priced in` };
+    }
+    return s;
+  }).filter(s => s.confidence >= CONFIG.CONFIDENCE_THRESHOLD);
+
   // 6. Apply regime adjustment to confidence scores
-  const regimeAdjusted = aboveThreshold.map(signal => {
+  const regimeAdjusted = ageChecked.map(signal => {
     const { adjustment, note } = getRegimeAdjustment(cachedRegime, signal.asset, signal.direction);
     if (adjustment !== 0) {
       console.log(`[Regime] ${signal.asset} ${signal.direction}: ${adjustment > 0 ? "+" : ""}${adjustment} (${note})`);
@@ -1086,13 +1188,17 @@ async function runScan() {
 
   // 7. Fire Telegram alerts + register for outcome tracking
   for (const signal of qualified) {
-    await sendTelegramSignal(signal);
-    if (signal.levels) registerSignalForTracking(signal, signal.levels);
-    totalSignalsFired++;
-    signalLog.unshift({
-      ...signal,
-      firedAt: new Date().toISOString(),
-    });
+    const result = await sendTelegramSignal(signal);
+    if (result.fired) {
+      if (signal.levels) registerSignalForTracking(signal, signal.levels);
+      totalSignalsFired++;
+      signalLog.unshift({
+        ...signal,
+        firedAt: new Date().toISOString(),
+      });
+    } else {
+      console.log(`[Hermes] Signal not fired for ${signal.asset}: ${result.reason || "unknown"}`);
+    }
   }
 
   // Keep log bounded
@@ -1100,7 +1206,7 @@ async function runScan() {
 
   usageStats.scans.total++;
   if (qualified.length > 0) usageStats.scans.withSignals++;
-  console.log(`[Hermes] Scan complete. ${qualified.length} signals fired (from ${aboveThreshold.length} above threshold).`);
+  console.log(`[Hermes] Scan complete. ${qualified.length} signals fired (from ${ageChecked.length} after all pre-filters).`);
 
   // Check outcomes of previously fired signals
   await checkPendingOutcomes();
