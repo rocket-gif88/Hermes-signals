@@ -17,6 +17,7 @@ const CONFIG = {
   TWELVE_DATA_API_KEY: process.env.TWELVE_DATA_API_KEY,
   CONFIDENCE_THRESHOLD: parseInt(process.env.CONFIDENCE_THRESHOLD || "75"),
   SCAN_INTERVAL_MINUTES: parseInt(process.env.SCAN_INTERVAL_MINUTES || "15"),
+  AURUM_URL: process.env.AURUM_URL || null, // e.g. https://your-aurum-app.railway.app
 };
 
 // ─── STATE ──────────────────────────────────────────────────────────────────
@@ -872,16 +873,26 @@ async function sendTelegramSignal(signal) {
   const urgEmoji = urgencyEmoji(signal.urgency);
   const bar = "━━━━━━━━━━━━━━━━━━";
 
-  // Fetch price levels + market context in parallel
+  // ── Aurum confluence check (runs in parallel with price/context fetch) ───
   let levelsBlock = "";
   let contextBlock = "";
   let statusBlock = "";
+  let confluenceBlock = "";
   const symbol = resolveSymbol(signal.asset);
+
+  const [priceData, ctx, aurumConfluence] = await Promise.all([
+    symbol ? fetchPriceAndATR(symbol) : Promise.resolve(null),
+    symbol ? fetchMarketContext(symbol) : Promise.resolve(null),
+    checkAurumConfluence(signal.asset, signal.direction),
+  ]);
+
+  // Apply Aurum confidence boost before any gating decisions
+  if (aurumConfluence?.confidenceBoost > 0) {
+    signal.confidence = Math.min(100, signal.confidence + aurumConfluence.confidenceBoost);
+    console.log(`[Aurum] ${signal.asset} confluence boost +${aurumConfluence.confidenceBoost} → ${signal.confidence} (${aurumConfluence.tier})`);
+  }
+
   if (symbol) {
-    const [priceData, ctx] = await Promise.all([
-      fetchPriceAndATR(symbol),
-      fetchMarketContext(symbol),
-    ]);
 
     if (priceData) {
       const L = calculateLevels(priceData.currentPrice, priceData.atr, signal.direction);
@@ -924,10 +935,16 @@ async function sendTelegramSignal(signal) {
       const conf = signal.confidence;
       let statusLine, sizingNote;
 
-      if (conf >= 80 && !isCounterTrend) {
-        statusLine  = `🟢 <b>STATUS: HIGH CONFIDENCE</b> — Full size`;
+      // Upgrade status tier if Aurum confluence is strong
+      const hasStrongConfluence = aurumConfluence?.tier === "STRONG";
+      const hasPartialConfluence = aurumConfluence?.tier === "PARTIAL";
+
+      if (hasStrongConfluence || (conf >= 80 && !isCounterTrend)) {
+        statusLine = hasStrongConfluence
+          ? `🔴 <b>STATUS: CONFLUENCE</b> — Macro + Technical aligned`
+          : `🟢 <b>STATUS: HIGH CONFIDENCE</b> — Full size`;
         sizingNote  = `Suggested risk: 1% of account`;
-      } else if (conf >= 75 || isCounterTrend) {
+      } else if (conf >= 75 || isCounterTrend || hasPartialConfluence) {
         statusLine  = `🟡 <b>STATUS: CONDITIONAL</b> — Reduce size, TP1 only`;
         sizingNote  = `Suggested risk: 0.5% of account`;
       } else {
@@ -948,10 +965,35 @@ async function sendTelegramSignal(signal) {
     }
   }
 
+  // ── Aurum confluence block (appended after status) ─────────────────────────
+  if (aurumConfluence) {
+    if (aurumConfluence.aligned && aurumConfluence.hasActiveSetup) {
+      const stageLabels = { sweep: "Sweep ✓", move: "Strong move ✓", trend: "Trend shift ✓", pullback: "Pullback ✓", entry: "Entry ready ✓" };
+      const stageLabel  = stageLabels[aurumConfluence.stage] || aurumConfluence.stage;
+      const ageNote     = aurumConfluence.setupAgeMinutes ? `${aurumConfluence.setupAgeMinutes}m old` : "";
+      const ezNote      = aurumConfluence.entryZone?.low
+        ? `Zone: ${aurumConfluence.entryZone.low}–${aurumConfluence.entryZone.high}`
+        : "";
+      confluenceBlock =
+        `${bar}\n` +
+        `⚡ <b>AURUM CONFLUENCE</b> — ${aurumConfluence.tier}\n` +
+        `<b>Stage:</b>     ${stageLabel} (${aurumConfluence.stageScore}/5)${ageNote ? "  " + ageNote : ""}\n` +
+        `<b>HTF Bias:</b>  ${aurumConfluence.htfBias} | H1: ${aurumConfluence.h1Bias}\n` +
+        `<b>Zone:</b>      ${aurumConfluence.zoneFreshness || "UNKNOWN"}${ezNote ? "  " + ezNote : ""}\n` +
+        `<b>Score:</b>     ${aurumConfluence.confluenceScore}/100 (+${aurumConfluence.confidenceBoost} conf boost)\n`;
+    } else if (aurumConfluence.conflicting) {
+      confluenceBlock =
+        `${bar}\n` +
+        `⚡ <b>AURUM</b> — ⚠️ Technical setup is ${aurumConfluence.direction} (conflicts with this signal)\n`;
+    } else if (!aurumConfluence.hasActiveSetup && aurumConfluence.aurumSym) {
+      confluenceBlock =
+        `${bar}\n` +
+        `⚡ <b>AURUM</b> — No active setup on ${aurumConfluence.aurumSym} (news-only signal)\n`;
+    }
+  }
+
   const hasLevels = levelsBlock.length > 0;
   const tier = getTier(signal.asset, hasLevels);
-
-
 
   const msg =
     `🗞 <b>HERMES SIGNAL</b>\n` +
@@ -966,6 +1008,7 @@ async function sendTelegramSignal(signal) {
     levelsBlock +
     contextBlock +
     statusBlock +
+    confluenceBlock +
     (cachedRegime && hasLevels ?
       `${bar}\n` +
       `🌐 <b>MARKET REGIME</b>\n` +
@@ -1014,6 +1057,63 @@ async function sendTelegramStatus(message) {
     );
   } catch (e) {
     console.error("[Telegram] Status send error:", e.message);
+  }
+}
+
+// ─── AURUM CONFLUENCE ENGINE ──────────────────────────────────────────────────
+// Maps Hermes asset names to Aurum symbol keys.
+// Only assets Aurum actively tracks return meaningful confluence scores.
+const HERMES_TO_AURUM_SYMBOL = {
+  "XAU/USD": "XAUUSD",
+  "XAG/USD": "XAGUSD",
+  // Expand as Aurum adds WTI, EUR/USD etc.
+};
+
+// Queries Aurum's /setup-state endpoint and returns confluence data for the
+// given asset+direction. Returns null if Aurum is unreachable or asset not tracked.
+//
+// Confluence tiers (based on Aurum confluenceScore):
+//   >= 70  — STRONG  -> +15 confidence boost, CONFLUENCE label
+//   50-69  — PARTIAL -> +7 confidence boost, noted in STATUS
+//   < 50   — WEAK    -> no boost (setup exists but structure is shallow)
+//   no setup         -> neutral (no boost, no penalty)
+async function checkAurumConfluence(hermesAsset, direction) {
+  if (!CONFIG.AURUM_URL) return null;
+
+  const aurumSym = HERMES_TO_AURUM_SYMBOL[hermesAsset];
+  if (!aurumSym) return null;
+
+  try {
+    const res = await axios.get(`${CONFIG.AURUM_URL}/setup-state`, { timeout: 5000 });
+    const state = res.data?.[aurumSym];
+    if (!state) return null;
+
+    const hermesDir   = direction === "bullish" ? "BUY" : "SELL";
+    const aurumDir    = state.direction;
+    const aligned     = state.hasActiveSetup && aurumDir === hermesDir;
+    const conflicting = state.hasActiveSetup && aurumDir && aurumDir !== hermesDir;
+
+    let tier = "NONE";
+    let confidenceBoost = 0;
+    if (aligned) {
+      if (state.confluenceScore >= 70)      { tier = "STRONG";  confidenceBoost = 15; }
+      else if (state.confluenceScore >= 50) { tier = "PARTIAL"; confidenceBoost = 7;  }
+      else                                  { tier = "WEAK";    confidenceBoost = 0;  }
+    }
+
+    return {
+      aurumSym, hasActiveSetup: state.hasActiveSetup,
+      aligned, conflicting,
+      direction: aurumDir, stage: state.stage, stageScore: state.stageScore,
+      setupAgeMinutes: state.setupAgeMinutes,
+      htfBias: state.htfBias, h1Bias: state.h1Bias,
+      zoneFreshness: state.zoneFreshness,
+      confluenceScore: state.confluenceScore, entryZone: state.entryZone,
+      hasOpenTrade: state.hasOpenTrade, tier, confidenceBoost,
+    };
+  } catch(e) {
+    console.error("[Aurum] Confluence check failed:", e.message);
+    return null;
   }
 }
 
@@ -1195,6 +1295,7 @@ async function runScan() {
       signalLog.unshift({
         ...signal,
         firedAt: new Date().toISOString(),
+        aurumTier: signal._aurumTier || "NONE",
       });
     } else {
       console.log(`[Hermes] Signal not fired for ${signal.asset}: ${result.reason || "unknown"}`);
@@ -1231,6 +1332,8 @@ app.get("/status", (req, res) => {
     totalSignalsFired,
     confidenceThreshold: CONFIG.CONFIDENCE_THRESHOLD,
     scanIntervalMinutes: CONFIG.SCAN_INTERVAL_MINUTES,
+    aurumConnected: !!CONFIG.AURUM_URL,
+    aurumUrl: CONFIG.AURUM_URL ? CONFIG.AURUM_URL.replace(/https?:\/\//, "").split(".")[0] + "..." : "not configured",
     seenHeadlinesCache: seenHeadlines.size,
     keywordCategories: Object.keys(KEYWORDS),
     totalKeywords: ALL_KEYWORDS.length,
