@@ -1066,7 +1066,10 @@ async function sendTelegramStatus(message) {
 const HERMES_TO_AURUM_SYMBOL = {
   "XAU/USD": "XAUUSD",
   "XAG/USD": "XAGUSD",
-  // Expand as Aurum adds WTI, EUR/USD etc.
+  "WTI":     "WTIUSD",
+  "WTI/USD": "WTIUSD",
+  "Brent":   null,  // Brent not tracked by Aurum yet
+  // Expand as Aurum adds EUR/USD etc.
 };
 
 // Queries Aurum's /setup-state endpoint and returns confluence data for the
